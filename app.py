@@ -45,6 +45,8 @@ HTML = """
 
 @app.route("/")
 def index():
+    return "OK"
+    
     api_key = os.getenv("NETLAB_API_KEY")
     if not api_key:
         return "NETLAB_API_KEY not set", 500
