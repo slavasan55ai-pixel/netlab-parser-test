@@ -1,6 +1,4 @@
-from flask import Flask, render_template_string
-import os
-from parser_netlab import one_time_fetch
+from flask import Flask
 
 app = Flask(__name__)
 
@@ -45,7 +43,7 @@ HTML = """
 
 @app.route("/")
 def index():
-    return "OK"
+    return "Netlab parser test OK"
     
     api_key = os.getenv("NETLAB_API_KEY")
     if not api_key:
