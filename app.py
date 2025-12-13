@@ -1,57 +1,38 @@
-from flask import Flask
+import os
+import requests
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Netlab Test Dashboard</title>
-    <style>
-        body { font-family: Arial; padding: 20px; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { border: 1px solid #ccc; padding: 6px; font-size: 14px; }
-        th { background: #eee; }
-    </style>
-</head>
-<body>
-<h2>Netlab Test Dashboard</h2>
+NETLAB_LOGIN = os.getenv("NETLAB_LOGIN")
+NETLAB_PASSWORD = os.getenv("NETLAB_PASSWORD")
 
-<p>Данные загружены: {{ rows|length }} шт.</p>
-
-<table>
-    <tr>
-        <th>Категория</th>
-        <th>Товар</th>
-        <th>SKU</th>
-        <th>Цена</th>
-    </tr>
-    {% for r in rows %}
-    <tr>
-        <td>{{ r.category_name }}</td>
-        <td>{{ r.name }}</td>
-        <td>{{ r.sku }}</td>
-        <td>{{ r.price }}</td>
-    </tr>
-    {% endfor %}
-</table>
-
-</body>
-</html>
-"""
+BASE_URL = "https://api.netlab.ru"
 
 @app.route("/")
 def index():
-    return "Netlab parser test OK"
-    
-    api_key = os.getenv("NETLAB_API_KEY")
-    if not api_key:
-        return "NETLAB_API_KEY not set", 500
+    if not NETLAB_LOGIN or not NETLAB_PASSWORD:
+        return jsonify({
+            "status": "error",
+            "message": "NETLAB_LOGIN / NETLAB_PASSWORD not set",
+            "hint": "Add them in Render → Environment"
+        }), 500
 
-    rows = one_time_fetch(api_key)
-    return render_template_string(HTML, rows=rows)
+    try:
+        response = requests.get(
+            f"{BASE_URL}/categories",
+            auth=(NETLAB_LOGIN, NETLAB_PASSWORD),
+            timeout=15
+        )
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+        return jsonify({
+            "status": "ok",
+            "http_status": response.status_code,
+            "data": response.json()
+        })
 
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "exception": str(e)
+        }), 500
