@@ -108,7 +108,7 @@ def dashboard():
             HTML,
             data=result,
             mode="LIVE",
-            source="Netlab REST API"
+            data_source="Netlab REST API"
         )
 
     except Exception as e:
