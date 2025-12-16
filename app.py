@@ -116,5 +116,5 @@ def dashboard():
             HTML,
             data=mock_data(),
             mode="DEMO",
-            source=f"Mock (нет доступа к API: {str(e)})"
+            data_source=f"Mock (нет доступа к API: {str(e)})"
         )
