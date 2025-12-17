@@ -130,7 +130,7 @@ li { margin:4px 0; }
 <body>
 
 <h1>Каталог Netlab</h1>
-<div class="meta">Источник данных: {{ source }}</div>
+<div class="meta">Источник данных: {{ data_source }}</div>
 
 <div class="container">
 
@@ -184,13 +184,13 @@ def index():
             source = f"Mock (ошибка API)"
     else:
         categories = build_category_tree(MOCK_CATEGORIES)
-        source = "Mock (демо-каталог)"
+        data_source = "Mock (демо-каталог)"
 
     return render_template_string(
         HTML,
         categories=categories,
         products=MOCK_PRODUCTS,
-        source=source
+        data_source=data_source
     )
 
 # ---------------------------
