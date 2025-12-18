@@ -1,13 +1,55 @@
-from flask import Flask, render_template_string
 import os
+import psycopg2
+import psycopg2.extras
+from flask import Flask, render_template_string
 
 app = Flask(__name__)
 
-# ===== НАСТРОЙКИ =====
-USE_REAL_NETLAB = False  # позже можно включить SOAP
-DATA_SOURCE = "Mock Netlab Catalog (structure compatible)"
+# ----------------------------
+# DATABASE
+# ----------------------------
 
-# ===== MOCK ДАННЫЕ (повторяют структуру каталога Netlab) =====
+def get_db():
+    return psycopg2.connect(
+        os.environ["DATABASE_URL"],
+        cursor_factory=psycopg2.extras.DictCursor,
+        sslmode="require"
+    )
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS categories (
+        id BIGINT PRIMARY KEY,
+        name TEXT NOT NULL
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        id BIGINT PRIMARY KEY,
+        name TEXT NOT NULL,
+        vendor TEXT,
+        category_id BIGINT REFERENCES categories(id),
+        image_url TEXT
+    );
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# вызываем инициализацию при старте
+init_db()
+
+# ----------------------------
+# MOCK DATA (временно)
+# ----------------------------
+
 def get_mock_catalog():
     return [
         {
@@ -15,38 +57,19 @@ def get_mock_catalog():
             "name": "Серверное оборудование",
             "children": [
                 {
-                    "id": 101,
                     "name": "Серверы",
                     "products": [
                         {
-                            "id": 1001,
+                            "id": 101,
                             "name": "Dell PowerEdge R750",
                             "vendor": "Dell",
-                            "image": "https://i.imgur.com/6XKQzYQ.png"
+                            "image": "https://i.imgur.com/4YQZ6sK.png"
                         },
                         {
-                            "id": 1002,
+                            "id": 102,
                             "name": "HPE ProLiant DL380",
                             "vendor": "HPE",
-                            "image": "https://i.imgur.com/9QO3YkF.png"
-                        }
-                    ]
-                }
-            ]
-        },
-        {
-            "id": 2,
-            "name": "Сетевое оборудование",
-            "children": [
-                {
-                    "id": 201,
-                    "name": "Коммутаторы",
-                    "products": [
-                        {
-                            "id": 2001,
-                            "name": "Cisco Catalyst 9200",
-                            "vendor": "Cisco",
-                            "image": "https://i.imgur.com/1JQ9ZQO.png"
+                            "image": "https://i.imgur.com/W5Z8yYf.png"
                         }
                     ]
                 }
@@ -55,66 +78,128 @@ def get_mock_catalog():
     ]
 
 
-def load_catalog():
-    if USE_REAL_NETLAB:
-        # здесь позже будет SOAP-клиент
-        return []
-    return get_mock_catalog()
+def save_catalog_to_db(catalog):
+    conn = get_db()
+    cur = conn.cursor()
+
+    for cat in catalog:
+        cur.execute(
+            """
+            INSERT INTO categories (id, name)
+            VALUES (%s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (cat["id"], cat["name"])
+        )
+
+        for block in cat.get("children", []):
+            for p in block.get("products", []):
+                cur.execute(
+                    """
+                    INSERT INTO products
+                    (id, name, vendor, category_id, image_url)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        p["id"],
+                        p["name"],
+                        p.get("vendor"),
+                        cat["id"],
+                        p.get("image")
+                    )
+                )
+
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-# ===== HTML ШАБЛОН =====
+def load_catalog_from_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            c.id   AS cat_id,
+            c.name AS cat_name,
+            p.id   AS prod_id,
+            p.name AS prod_name,
+            p.vendor,
+            p.image_url
+        FROM categories c
+        LEFT JOIN products p ON p.category_id = c.id
+        ORDER BY c.name
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    catalog = {}
+
+    for r in rows:
+        if r["cat_id"] not in catalog:
+            catalog[r["cat_id"]] = {
+                "id": r["cat_id"],
+                "name": r["cat_name"],
+                "children": [{
+                    "name": "Товары",
+                    "products": []
+                }]
+            }
+
+        if r["prod_id"]:
+            catalog[r["cat_id"]]["children"][0]["products"].append({
+                "id": r["prod_id"],
+                "name": r["prod_name"],
+                "vendor": r["vendor"],
+                "image": r["image_url"]
+            })
+
+    return list(catalog.values())
+
+
+# ----------------------------
+# ROUTES
+# ----------------------------
+
 HTML = """
-<!DOCTYPE html>
-<html lang="ru">
+<!doctype html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>Netlab Catalog Dashboard</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #f5f5f5; }
-        h1 { margin-bottom: 5px; }
-        .source { color: #666; margin-bottom: 20px; }
-        .category { margin: 20px 0; }
-        .subcategory { margin-left: 20px; }
-        .products { display: flex; gap: 15px; flex-wrap: wrap; margin-left: 40px; }
-        .card {
-            background: white;
-            border-radius: 6px;
-            padding: 10px;
-            width: 200px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-        }
-        .card img {
-            max-width: 100%;
-            height: 120px;
-            object-fit: contain;
-        }
-        .vendor { color: #888; font-size: 13px; }
-    </style>
+<meta charset="utf-8">
+<title>Netlab Catalog</title>
+<style>
+body { font-family: Arial; background: #f6f7f8; padding: 20px; }
+h1 { margin-bottom: 10px; }
+.category { background: #fff; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
+.products { display: flex; gap: 15px; flex-wrap: wrap; }
+.product { width: 200px; border: 1px solid #ddd; padding: 10px; border-radius: 6px; background: #fafafa; }
+.product img { width: 100%; height: 120px; object-fit: contain; }
+.vendor { font-size: 12px; color: #666; }
+</style>
 </head>
 <body>
 
-<h1>Каталог Netlab</h1>
-<div class="source">Источник данных: {{ data_source }}</div>
+<h1>Каталог Netlab (тест)</h1>
+<p>Источник данных: {{ data_source }}</p>
 
 {% for cat in catalog %}
 <div class="category">
-    <h2>{{ cat.name }}</h2>
-
-    {% for sub in cat.children %}
-    <div class="subcategory">
-        <h3>{{ sub.name }}</h3>
-
-        <div class="products">
-            {% for p in sub.products %}
-            <div class="card">
-                <img src="{{ p.image }}" alt="">
-                <strong>{{ p.name }}</strong>
-                <div class="vendor">{{ p.vendor }}</div>
-            </div>
-            {% endfor %}
+  <h2>{{ cat.name }}</h2>
+  {% for block in cat.children %}
+    <div class="products">
+      {% for p in block.products %}
+        <div class="product">
+          {% if p.image %}
+            <img src="{{ p.image }}">
+          {% endif %}
+          <strong>{{ p.name }}</strong><br>
+          <span class="vendor">{{ p.vendor }}</span>
         </div>
+      {% endfor %}
     </div>
-    {% endfor %}
+  {% endfor %}
 </div>
 {% endfor %}
 
@@ -122,18 +207,25 @@ HTML = """
 </html>
 """
 
-# ===== ROUTE =====
+
 @app.route("/")
 def index():
-    catalog = load_catalog()
+    # первый запуск — наполняем БД mock-данными
+    if not load_catalog_from_db():
+        save_catalog_to_db(get_mock_catalog())
+
+    catalog = load_catalog_from_db()
+
     return render_template_string(
         HTML,
         catalog=catalog,
-        data_source=DATA_SOURCE
+        data_source="Mock → PostgreSQL (Render)"
     )
 
 
-# ===== ENTRY POINT =====
+# ----------------------------
+# ENTRY POINT
+# ----------------------------
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
