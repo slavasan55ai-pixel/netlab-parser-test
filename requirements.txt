@@ -1,5 +1,5 @@
-Flask
-gunicorn
-zeep
+Flask>=2.3.0
+gunicorn>=21.2.0
+zeep>=5.0.0
 psycopg2-binary
-requests
+requests>=2.31.0
