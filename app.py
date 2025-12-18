@@ -4,44 +4,32 @@ from datetime import datetime
 from flask import Flask, render_template_string
 import psycopg2
 import psycopg2.extras
+
 from zeep import Client, Settings
 from zeep.transports import Transport
+from zeep.plugins import HistoryPlugin
 from requests import Session
 from requests.auth import HTTPBasicAuth
-
-# Для цветного вывода XML
-from pygments import highlight
-from pygments.lexers import XmlLexer
-from pygments.formatters import TerminalFormatter
 
 # =========================================================
 # LOGGING
 # =========================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logging.getLogger("zeep").setLevel(logging.DEBUG)
 
-# Папка для сохранения SOAP-запросов и ответов
 SOAP_LOG_DIR = "logs/soap"
 os.makedirs(SOAP_LOG_DIR, exist_ok=True)
 
-def save_and_print_soap_log(request_xml, response_xml):
-    # --- Сохраняем в файлы ---
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-    req_file = os.path.join(SOAP_LOG_DIR, f"{timestamp}_request.xml")
-    res_file = os.path.join(SOAP_LOG_DIR, f"{timestamp}_response.xml")
+def save_soap_log(history: HistoryPlugin):
+    if not history.last_sent or not history.last_received:
+        return
 
-    with open(req_file, "w", encoding="utf-8") as f:
-        f.write(request_xml)
-    with open(res_file, "w", encoding="utf-8") as f:
-        f.write(response_xml)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    with open(f"{SOAP_LOG_DIR}/{ts}_request.xml", "w", encoding="utf-8") as f:
+        f.write(history.last_sent["envelope"].decode())
 
-    # --- Цветной вывод в консоль ---
-    print("\n--- SOAP REQUEST ---")
-    print(highlight(request_xml, XmlLexer(), TerminalFormatter()))
-    print("\n--- SOAP RESPONSE ---")
-    print(highlight(response_xml, XmlLexer(), TerminalFormatter()))
-    print("-" * 80)
+    with open(f"{SOAP_LOG_DIR}/{ts}_response.xml", "w", encoding="utf-8") as f:
+        f.write(history.last_received["envelope"].decode())
 
 # =========================================================
 # FLASK
@@ -95,87 +83,73 @@ def get_netlab_client():
         os.environ["NETLAB_PASSWORD"]
     )
 
+    history = HistoryPlugin()
     transport = Transport(session=session, timeout=30)
     settings = Settings(strict=False, xml_huge_tree=True)
 
     client = Client(
         wsdl=os.environ["NETLAB_WSDL"],
         transport=transport,
-        settings=settings
+        settings=settings,
+        plugins=[history]
     )
-    return client
+
+    return client, history
 
 def load_netlab_catalog():
-    client = get_netlab_client()
-    try:
-        response = client.service.GetCatalog()
+    client, history = get_netlab_client()
 
-        # Получаем последний SOAP-запрос и ответ
-        history = client.history
-        if history.last_sent and history.last_received:
-            request_xml = history.last_sent["envelope"].decode("utf-8")
-            response_xml = history.last_received["envelope"].decode("utf-8")
-            save_and_print_soap_log(request_xml, response_xml)
+    # ⚠️ Метод должен быть проверен по WSDL
+    response = client.service.GetCatalog()
 
-        catalog = []
-        for cat in response.Categories:
-            category = {
-                "id": int(cat.Id),
-                "name": cat.Name,
-                "children": [{
-                    "name": "Товары",
-                    "products": []
-                }]
-            }
-            for p in cat.Products:
-                category["children"][0]["products"].append({
-                    "id": int(p.Id),
-                    "name": p.Name,
-                    "vendor": p.Vendor,
-                    "image": getattr(p, "ImageUrl", None)
-                })
-            catalog.append(category)
+    save_soap_log(history)
 
-        return catalog
+    catalog = []
 
-    except Exception as e:
-        logger.exception("Ошибка при загрузке Netlab SOAP каталога:")
-        raise
+    for cat in response.Categories:
+        cat_id = int(cat.Id)
+        catalog.append({
+            "id": cat_id,
+            "name": cat.Name,
+            "children": [{
+                "name": "Товары",
+                "products": []
+            }]
+        })
+
+        for p in getattr(cat, "Products", []):
+            catalog[-1]["children"][0]["products"].append({
+                "id": int(p.Id),
+                "name": p.Name,
+                "vendor": getattr(p, "Vendor", None),
+                "image": getattr(p, "ImageUrl", None)
+            })
+
+    return catalog
 
 # =========================================================
-# DATABASE OPERATIONS
+# DATABASE OPS
 # =========================================================
 def save_catalog_to_db(catalog):
     conn = get_db()
     cur = conn.cursor()
 
-    for cat in catalog:
+    for c in catalog:
         cur.execute(
-            """
-            INSERT INTO categories (id, name)
-            VALUES (%s, %s)
-            ON CONFLICT (id) DO NOTHING
-            """,
-            (cat["id"], cat["name"])
+            "INSERT INTO categories (id, name) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (c["id"], c["name"])
         )
 
-        for block in cat["children"]:
-            for p in block["products"]:
-                cur.execute(
-                    """
-                    INSERT INTO products
-                    (id, name, vendor, category_id, image_url)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO NOTHING
-                    """,
-                    (
-                        p["id"],
-                        p["name"],
-                        p.get("vendor"),
-                        cat["id"],
-                        p.get("image")
-                    )
-                )
+        for p in c["children"][0]["products"]:
+            cur.execute(
+                """
+                INSERT INTO products
+                (id, name, vendor, category_id, image_url)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (p["id"], p["name"], p["vendor"], c["id"], p["image"])
+            )
 
     conn.commit()
     cur.close()
@@ -186,13 +160,8 @@ def load_catalog_from_db():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT
-            c.id   AS cat_id,
-            c.name AS cat_name,
-            p.id   AS prod_id,
-            p.name AS prod_name,
-            p.vendor,
-            p.image_url
+        SELECT c.id cid, c.name cname,
+               p.id pid, p.name pname, p.vendor, p.image_url
         FROM categories c
         LEFT JOIN products p ON p.category_id = c.id
         ORDER BY c.name
@@ -201,66 +170,41 @@ def load_catalog_from_db():
     rows = cur.fetchall()
     conn.close()
 
-    catalog = {}
+    result = {}
     for r in rows:
-        if r["cat_id"] not in catalog:
-            catalog[r["cat_id"]] = {
-                "id": r["cat_id"],
-                "name": r["cat_name"],
-                "children": [{
-                    "name": "Товары",
-                    "products": []
-                }]
+        if r["cid"] not in result:
+            result[r["cid"]] = {
+                "id": r["cid"],
+                "name": r["cname"],
+                "children": [{"name": "Товары", "products": []}]
             }
-        if r["prod_id"]:
-            catalog[r["cat_id"]]["children"][0]["products"].append({
-                "id": r["prod_id"],
-                "name": r["prod_name"],
+        if r["pid"]:
+            result[r["cid"]]["children"][0]["products"].append({
+                "id": r["pid"],
+                "name": r["pname"],
                 "vendor": r["vendor"],
                 "image": r["image_url"]
             })
-    return list(catalog.values())
+
+    return list(result.values())
 
 # =========================================================
 # DASHBOARD
 # =========================================================
-HTML = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Netlab SOAP Catalog</title>
-<style>
-body { font-family: Arial; background: #f4f6f8; padding: 20px; }
-.category { background: #fff; margin-bottom: 20px; padding: 15px; border-radius: 8px; }
-.products { display: flex; flex-wrap: wrap; gap: 15px; }
-.product { width: 220px; border: 1px solid #ddd; padding: 10px; border-radius: 6px; background: #fafafa; }
-.product img { width: 100%; height: 120px; object-fit: contain; }
-.vendor { font-size: 12px; color: #666; }
-</style>
-</head>
+HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Netlab</title></head>
 <body>
-
-<h1>Netlab Catalog (SOAP)</h1>
-<p>Источник данных: {{ data_source }}</p>
-
-{% for cat in catalog %}
-<div class="category">
-  <h2>{{ cat.name }}</h2>
-  <div class="products">
-  {% for p in cat.children[0].products %}
-    <div class="product">
-      {% if p.image %}<img src="{{ p.image }}">{% endif %}
-      <strong>{{ p.name }}</strong><br>
-      <span class="vendor">{{ p.vendor }}</span>
-    </div>
-  {% endfor %}
-  </div>
-</div>
+<h1>Netlab SOAP catalog</h1>
+<p>Источник: {{ data_source }}</p>
+{% for c in catalog %}
+<h2>{{ c.name }}</h2>
+<ul>
+{% for p in c.children[0].products %}
+<li>{{ p.name }} ({{ p.vendor }})</li>
 {% endfor %}
-
-</body>
-</html>
+</ul>
+{% endfor %}
+</body></html>
 """
 
 @app.route("/")
@@ -268,17 +212,13 @@ def index():
     try:
         catalog = load_netlab_catalog()
         save_catalog_to_db(catalog)
-        source = "Netlab SOAP (live)"
+        src = "Netlab SOAP (live)"
     except Exception as e:
-        logger.error("Ошибка SOAP, возвращаем кэш из PostgreSQL: %s", e)
+        logger.error("SOAP error: %s", e)
         catalog = load_catalog_from_db()
-        source = "PostgreSQL cache (SOAP error)"
+        src = "PostgreSQL cache"
 
-    return render_template_string(
-        HTML,
-        catalog=catalog,
-        data_source=source
-    )
+    return render_template_string(HTML, catalog=catalog, data_source=src)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
