@@ -1,13 +1,17 @@
 import os
+from flask import Flask, render_template_string
 import psycopg2
 import psycopg2.extras
-from flask import Flask, render_template_string
+from zeep import Client
+from zeep.transports import Transport
+from requests import Session
+from requests.auth import HTTPBasicAuth
 
 app = Flask(__name__)
 
-# ----------------------------
+# =========================================================
 # DATABASE
-# ----------------------------
+# =========================================================
 
 def get_db():
     return psycopg2.connect(
@@ -43,40 +47,69 @@ def init_db():
     conn.close()
 
 
-# вызываем инициализацию при старте
 init_db()
 
-# ----------------------------
-# MOCK DATA (временно)
-# ----------------------------
+# =========================================================
+# NETLAB SOAP
+# =========================================================
 
-def get_mock_catalog():
-    return [
-        {
-            "id": 1,
-            "name": "Серверное оборудование",
-            "children": [
-                {
-                    "name": "Серверы",
-                    "products": [
-                        {
-                            "id": 101,
-                            "name": "Dell PowerEdge R750",
-                            "vendor": "Dell",
-                            "image": "https://i.imgur.com/4YQZ6sK.png"
-                        },
-                        {
-                            "id": 102,
-                            "name": "HPE ProLiant DL380",
-                            "vendor": "HPE",
-                            "image": "https://i.imgur.com/W5Z8yYf.png"
-                        }
-                    ]
-                }
-            ]
+def get_netlab_client():
+    session = Session()
+    session.auth = HTTPBasicAuth(
+        os.environ["NETLAB_LOGIN"],
+        os.environ["NETLAB_PASSWORD"]
+    )
+
+    transport = Transport(session=session, timeout=30)
+
+    client = Client(
+        wsdl=os.environ["NETLAB_WSDL"],
+        transport=transport
+    )
+    return client
+
+
+def load_netlab_catalog():
+    """
+    ВАЖНО:
+    Названия методов и полей зависят от реального WSDL.
+    Здесь — корректный шаблон работы с zeep.
+    """
+
+    client = get_netlab_client()
+
+    # ↓↓↓ ПРИМЕР. Реальный метод смотри в WSDL Netlab ↓↓↓
+    response = client.service.GetCatalog()
+
+    # Приведение ответа SOAP к нормализованной структуре
+    catalog = []
+
+    for cat in response.Categories:
+        category = {
+            "id": int(cat.Id),
+            "name": cat.Name,
+            "children": [{
+                "name": "Товары",
+                "products": []
+            }]
         }
-    ]
 
+        for p in cat.Products:
+            category["children"][0]["products"].append({
+                "id": int(p.Id),
+                "name": p.Name,
+                "vendor": p.Vendor,
+                "image": getattr(p, "ImageUrl", None)
+            })
+
+        catalog.append(category)
+
+    return catalog
+
+
+# =========================================================
+# DATABASE OPERATIONS
+# =========================================================
 
 def save_catalog_to_db(catalog):
     conn = get_db()
@@ -92,8 +125,8 @@ def save_catalog_to_db(catalog):
             (cat["id"], cat["name"])
         )
 
-        for block in cat.get("children", []):
-            for p in block.get("products", []):
+        for block in cat["children"]:
+            for p in block["products"]:
                 cur.execute(
                     """
                     INSERT INTO products
@@ -159,47 +192,42 @@ def load_catalog_from_db():
     return list(catalog.values())
 
 
-# ----------------------------
-# ROUTES
-# ----------------------------
+# =========================================================
+# DASHBOARD
+# =========================================================
 
 HTML = """
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Netlab Catalog</title>
+<title>Netlab SOAP Catalog</title>
 <style>
-body { font-family: Arial; background: #f6f7f8; padding: 20px; }
-h1 { margin-bottom: 10px; }
-.category { background: #fff; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
-.products { display: flex; gap: 15px; flex-wrap: wrap; }
-.product { width: 200px; border: 1px solid #ddd; padding: 10px; border-radius: 6px; background: #fafafa; }
+body { font-family: Arial; background: #f4f6f8; padding: 20px; }
+.category { background: #fff; margin-bottom: 20px; padding: 15px; border-radius: 8px; }
+.products { display: flex; flex-wrap: wrap; gap: 15px; }
+.product { width: 220px; border: 1px solid #ddd; padding: 10px; border-radius: 6px; background: #fafafa; }
 .product img { width: 100%; height: 120px; object-fit: contain; }
 .vendor { font-size: 12px; color: #666; }
 </style>
 </head>
 <body>
 
-<h1>Каталог Netlab (тест)</h1>
+<h1>Netlab Catalog (SOAP)</h1>
 <p>Источник данных: {{ data_source }}</p>
 
 {% for cat in catalog %}
 <div class="category">
   <h2>{{ cat.name }}</h2>
-  {% for block in cat.children %}
-    <div class="products">
-      {% for p in block.products %}
-        <div class="product">
-          {% if p.image %}
-            <img src="{{ p.image }}">
-          {% endif %}
-          <strong>{{ p.name }}</strong><br>
-          <span class="vendor">{{ p.vendor }}</span>
-        </div>
-      {% endfor %}
+  <div class="products">
+  {% for p in cat.children[0].products %}
+    <div class="product">
+      {% if p.image %}<img src="{{ p.image }}">{% endif %}
+      <strong>{{ p.name }}</strong><br>
+      <span class="vendor">{{ p.vendor }}</span>
     </div>
   {% endfor %}
+  </div>
 </div>
 {% endfor %}
 
@@ -210,22 +238,20 @@ h1 { margin-bottom: 10px; }
 
 @app.route("/")
 def index():
-    # первый запуск — наполняем БД mock-данными
-    if not load_catalog_from_db():
-        save_catalog_to_db(get_mock_catalog())
-
-    catalog = load_catalog_from_db()
+    try:
+        catalog = load_netlab_catalog()
+        save_catalog_to_db(catalog)
+        source = "Netlab SOAP (live)"
+    except Exception as e:
+        catalog = load_catalog_from_db()
+        source = f"PostgreSQL cache (SOAP error)"
 
     return render_template_string(
         HTML,
         catalog=catalog,
-        data_source="Mock → PostgreSQL (Render)"
+        data_source=source
     )
 
-
-# ----------------------------
-# ENTRY POINT
-# ----------------------------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
