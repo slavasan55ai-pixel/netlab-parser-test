@@ -9,6 +9,11 @@ from zeep.transports import Transport
 from requests import Session
 from requests.auth import HTTPBasicAuth
 
+# Для цветного вывода XML
+from pygments import highlight
+from pygments.lexers import XmlLexer
+from pygments.formatters import TerminalFormatter
+
 # =========================================================
 # LOGGING
 # =========================================================
@@ -20,7 +25,8 @@ logging.getLogger("zeep").setLevel(logging.DEBUG)
 SOAP_LOG_DIR = "logs/soap"
 os.makedirs(SOAP_LOG_DIR, exist_ok=True)
 
-def save_soap_log(request_xml, response_xml):
+def save_and_print_soap_log(request_xml, response_xml):
+    # --- Сохраняем в файлы ---
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
     req_file = os.path.join(SOAP_LOG_DIR, f"{timestamp}_request.xml")
     res_file = os.path.join(SOAP_LOG_DIR, f"{timestamp}_response.xml")
@@ -29,6 +35,13 @@ def save_soap_log(request_xml, response_xml):
         f.write(request_xml)
     with open(res_file, "w", encoding="utf-8") as f:
         f.write(response_xml)
+
+    # --- Цветной вывод в консоль ---
+    print("\n--- SOAP REQUEST ---")
+    print(highlight(request_xml, XmlLexer(), TerminalFormatter()))
+    print("\n--- SOAP RESPONSE ---")
+    print(highlight(response_xml, XmlLexer(), TerminalFormatter()))
+    print("-" * 80)
 
 # =========================================================
 # FLASK
@@ -93,22 +106,17 @@ def get_netlab_client():
     return client
 
 def load_netlab_catalog():
-    """
-    Загружает каталог из Netlab через SOAP с сохранением XML запросов/ответов.
-    """
     client = get_netlab_client()
     try:
-        # Выполняем SOAP-запрос
         response = client.service.GetCatalog()
 
-        # Логируем запрос и ответ
+        # Получаем последний SOAP-запрос и ответ
         history = client.history
-        if history.last_sent:
+        if history.last_sent and history.last_received:
             request_xml = history.last_sent["envelope"].decode("utf-8")
             response_xml = history.last_received["envelope"].decode("utf-8")
-            save_soap_log(request_xml, response_xml)
+            save_and_print_soap_log(request_xml, response_xml)
 
-        # Преобразование ответа SOAP в нормализованную структуру
         catalog = []
         for cat in response.Categories:
             category = {
