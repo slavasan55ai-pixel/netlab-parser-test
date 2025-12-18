@@ -1,5 +1,5 @@
 Flask
 gunicorn
-zeep
 requests
 lxml
+zeep
