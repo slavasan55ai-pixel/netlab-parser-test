@@ -1,5 +1,5 @@
 Flask
 gunicorn
-requests
-lxml
 zeep
+psycopg2-binary
+python-dotenv
