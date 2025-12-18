@@ -1,6 +1,6 @@
 Flask>=2.3.0
 gunicorn>=21.2.0
-zeep>=5.0.0
+zeep
 psycopg2-binary
 requests>=2.31.0
 itsdangerous>=2.1.2
