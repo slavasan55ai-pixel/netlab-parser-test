@@ -12,37 +12,34 @@ from zeep.transports import Transport
 import psycopg2
 from psycopg2.extras import execute_values
 
-# -------------------------------------------------
+# =====================================================
 # CONFIG
-# -------------------------------------------------
+# =====================================================
 
-NETLAB_LOGIN = os.getenv("NETLAB_LOGIN")
-NETLAB_PASSWORD = os.getenv("NETLAB_PASSWORD")
-DATABASE_URL = os.getenv("DATABASE_URL")
+NETLAB_LOGIN = os.environ.get("NETLAB_LOGIN")
+NETLAB_PASSWORD = os.environ.get("NETLAB_PASSWORD")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 AUTH_WSDL = "http://services.netlab.ru/AuthenticationService?wsdl"
 REST_BASE = "http://services.netlab.ru/rest/catalogsZip"
-
 CATALOG_NAME = "catalog"
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# -------------------------------------------------
+# =====================================================
 # DB
-# -------------------------------------------------
+# =====================================================
 
 def db_conn():
-    return psycopg2.connect(DATABASE_URL)
-
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def db_execute(sql, params=None):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
-
 
 def db_fetch_all(sql, params=None):
     with db_conn() as conn:
@@ -50,11 +47,10 @@ def db_fetch_all(sql, params=None):
             cur.execute(sql, params)
             return cur.fetchall()
 
-
 def init_db():
-    """Создаёт минимально необходимую схему"""
     with db_conn() as conn:
         with conn.cursor() as cur:
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 id BIGINT PRIMARY KEY,
@@ -67,12 +63,13 @@ def init_db():
             CREATE TABLE IF NOT EXISTS products (
                 id BIGINT PRIMARY KEY,
                 category_id BIGINT REFERENCES categories(id),
-                is_deleted BOOLEAN DEFAULT FALSE,
-                price NUMERIC(12,2),
-                quantity INTEGER,
-                updated_at TIMESTAMP
+                is_deleted BOOLEAN DEFAULT FALSE
             );
             """)
+
+            cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS price NUMERIC(12,2);")
+            cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS quantity INTEGER;")
+            cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;")
 
             cur.execute("""
             CREATE TABLE IF NOT EXISTS product_properties (
@@ -91,28 +88,26 @@ def init_db():
             );
             """)
 
-    logger.info("DB schema ensured")
+    logger.info("Database schema ready")
 
+init_db()
 
-# -------------------------------------------------
+# =====================================================
 # XML
-# -------------------------------------------------
+# =====================================================
 
 def parse_xml(xml_bytes: bytes):
     parser = etree.XMLParser(recover=True, huge_tree=True)
     return etree.parse(BytesIO(xml_bytes), parser)
 
-
 NS = {"ns": "http://ws.web.netlab.com/"}
 
-# -------------------------------------------------
+# =====================================================
 # AUTH SOAP
-# -------------------------------------------------
+# =====================================================
 
 def get_token():
-    transport = Transport(timeout=30)
-    client = Client(AUTH_WSDL, transport=transport)
-
+    client = Client(AUTH_WSDL, transport=Transport(timeout=30))
     result = client.service.authenticate(
         arg0=NETLAB_LOGIN,
         arg1=NETLAB_PASSWORD
@@ -123,53 +118,46 @@ def get_token():
 
     return result["data"]["token"]
 
-# -------------------------------------------------
+# =====================================================
 # REST
-# -------------------------------------------------
+# =====================================================
 
 def rest_get(path, token, params=None):
     params = params or {}
     params["oauth_token"] = token
-
     url = f"{REST_BASE}/{path}"
     r = requests.get(url, params=params, timeout=120)
     r.raise_for_status()
     return parse_xml(r.content)
 
-# -------------------------------------------------
-# CATEGORIES
-# -------------------------------------------------
+# =====================================================
+# LOADERS
+# =====================================================
 
-def fetch_categories(token):
+def load_categories(token):
     tree = rest_get(f"{CATALOG_NAME}.xml", token)
     rows = []
 
-    for cat in tree.xpath("//ns:category", namespaces=NS):
+    for c in tree.xpath("//ns:category", namespaces=NS):
         rows.append((
-            int(cat.findtext("ns:id", namespaces=NS)),
-            cat.findtext("ns:name", namespaces=NS),
-            cat.findtext("ns:parentId", namespaces=NS)
+            int(c.findtext("ns:id", namespaces=NS)),
+            c.findtext("ns:name", namespaces=NS),
+            c.findtext("ns:parentId", namespaces=NS)
         ))
 
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO categories (id, name, parent_id)
-                VALUES %s
-                ON CONFLICT (id) DO UPDATE
-                SET name = EXCLUDED.name,
-                    parent_id = EXCLUDED.parent_id
-                """,
-                rows
-            )
+    execute_values(
+        db_conn().cursor(),
+        """
+        INSERT INTO categories (id, name, parent_id)
+        VALUES %s
+        ON CONFLICT (id) DO UPDATE
+        SET name = EXCLUDED.name,
+            parent_id = EXCLUDED.parent_id
+        """,
+        rows
+    )
 
-# -------------------------------------------------
-# PRODUCTS (2.2.4)
-# -------------------------------------------------
-
-def fetch_products_by_category(token, category_id):
+def load_products(token, category_id):
     tree = rest_get(
         f"versions/2/{CATALOG_NAME}/{category_id}.xml",
         token,
@@ -178,46 +166,40 @@ def fetch_products_by_category(token, category_id):
 
     rows = []
 
-    for goods in tree.xpath("//ns:goods", namespaces=NS):
-        gid = int(goods.findtext("ns:id", namespaces=NS))
+    for g in tree.xpath("//ns:goods", namespaces=NS):
+        gid = int(g.findtext("ns:id", namespaces=NS))
         deleted = False
 
-        for prop in goods.xpath(".//ns:property", namespaces=NS):
-            if prop.findtext("ns:name", namespaces=NS) == "Deleted":
-                deleted = prop.findtext("ns:value", namespaces=NS) == "true"
+        for p in g.xpath(".//ns:property", namespaces=NS):
+            if p.findtext("ns:name", namespaces=NS) == "Deleted":
+                deleted = p.findtext("ns:value", namespaces=NS) == "true"
 
         rows.append((gid, category_id, deleted))
 
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO products (id, category_id, is_deleted)
-                VALUES %s
-                ON CONFLICT (id) DO UPDATE
-                SET is_deleted = EXCLUDED.is_deleted
-                """,
-                rows
-            )
+    execute_values(
+        db_conn().cursor(),
+        """
+        INSERT INTO products (id, category_id, is_deleted)
+        VALUES %s
+        ON CONFLICT (id) DO UPDATE
+        SET is_deleted = EXCLUDED.is_deleted
+        """,
+        rows
+    )
 
-# -------------------------------------------------
-# PRICES (2.2.10)
-# -------------------------------------------------
-
-def fetch_price(token, goods_id):
+def load_price(token, goods_id):
     tree = rest_get(f"goodsByUid/{goods_id}.xml", token)
 
     price = None
     qty = None
 
-    for prop in tree.xpath("//ns:property", namespaces=NS):
-        name = prop.findtext("ns:name", namespaces=NS)
-        value = prop.findtext("ns:value", namespaces=NS)
+    for p in tree.xpath("//ns:property", namespaces=NS):
+        name = p.findtext("ns:name", namespaces=NS)
+        value = p.findtext("ns:value", namespaces=NS)
 
         if name == "Price":
             price = value
-        elif name == "Quantity":
+        if name == "Quantity":
             qty = value
 
     db_execute(
@@ -231,54 +213,41 @@ def fetch_price(token, goods_id):
         (price, qty, goods_id)
     )
 
-# -------------------------------------------------
+# =====================================================
 # API
-# -------------------------------------------------
-
-@app.route("/api/categories")
-def api_categories():
-    return jsonify(
-        db_fetch_all(
-            "SELECT id, name, parent_id FROM categories ORDER BY name"
-        )
-    )
-
+# =====================================================
 
 @app.route("/api/products")
 def api_products():
-    return jsonify(
-        db_fetch_all(
-            """
-            SELECT
-                p.id,
-                p.price,
-                p.quantity,
-                c.name AS category
-            FROM products p
-            JOIN categories c ON c.id = p.category_id
-            WHERE p.is_deleted = false
-            ORDER BY p.updated_at DESC NULLS LAST
-            LIMIT 200
-            """
-        )
-    )
+    rows = db_fetch_all("""
+        SELECT
+            p.id,
+            p.price,
+            p.quantity,
+            c.name AS category
+        FROM products p
+        JOIN categories c ON c.id = p.category_id
+        WHERE p.is_deleted = false
+        ORDER BY p.id
+        LIMIT 200
+    """)
+    return jsonify(rows)
 
-# -------------------------------------------------
+# =====================================================
 # DASHBOARD
-# -------------------------------------------------
+# =====================================================
 
 HTML = """
 <!doctype html>
 <html>
-<head><title>Netlab Dashboard</title></head>
+<head><meta charset="utf-8"><title>Netlab Dashboard</title></head>
 <body>
 <h1>Netlab products</h1>
-<pre id="data"></pre>
+<pre id="out"></pre>
 <script>
 fetch('/api/products')
 .then(r => r.json())
-.then(d => document.getElementById('data').innerText =
-    JSON.stringify(d, null, 2));
+.then(d => out.innerText = JSON.stringify(d, null, 2))
 </script>
 </body>
 </html>
@@ -288,11 +257,11 @@ fetch('/api/products')
 def index():
     return render_template_string(HTML)
 
-# -------------------------------------------------
-# BOOTSTRAP
-# -------------------------------------------------
-
-init_db()
+# =====================================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=10000)
+```
+
+---
+
